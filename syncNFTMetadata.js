@@ -1,11 +1,12 @@
 import { ethers } from "ethers";
 import { createClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
+import fetch from "node-fetch";
 
 dotenv.config();
 
 // =======================================
-// 1. SUPABASE KONFİQURASİYASI
+// SUPABASE
 // =======================================
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -13,23 +14,19 @@ const supabase = createClient(
 );
 
 // =======================================
-// 2. SABİTLƏR
+// CONSTANTS
 // =======================================
 const NFT_CONTRACT_ADDRESS = process.env.NFT_CONTRACT_ADDRESS;
-
-// Kolleksiyanın ümumi adı
-const COLLECTION_NAME_PREFIX = "Steptract Genesis"; 
-
-// 🛑 STOP LIMITİ: Yalnız ilk 2200 NFT oxunacaq (1/1-lər görünməyəcək)
-const MAX_NFT_ID = 2200; 
+const MARKETPLACE_CONTRACT_ADDRESS = process.env.SEAPORT_CONTRACT_ADDRESS;
 
 const RPC_LIST = [
   process.env.APECHAIN_RPC,
-  "https://rpc.apechain.com",
+  "https://rpc.apechain.com/http",
   "https://apechain.drpc.org",
   "https://33139.rpc.thirdweb.com"
 ];
 
+// RPC failover
 let providerIndex = 0;
 function getProvider() {
   const rpc = RPC_LIST[providerIndex % RPC_LIST.length];
@@ -40,138 +37,155 @@ function getProvider() {
 let provider = getProvider();
 
 // =======================================
-// 3. NFT CONTRACT
+// NFT ABI
 // =======================================
 const nftABI = [
   "function ownerOf(uint256 tokenid) view returns (address)",
-  "function totalSupply() view returns (uint256)"
+  "function totalSupply() view returns (uint256)",
+  "function tokenURI(uint256 tokenid) view returns (string)"
 ];
 
 let nftContract = new ethers.Contract(NFT_CONTRACT_ADDRESS, nftABI, provider);
 
 // =======================================
-// 4. ƏSAS PROSES (PROCESS NFT)
+// HELPERS
 // =======================================
+function convertIPFStoHTTP(uri) {
+  if (!uri) return null;
+  return uri.startsWith("ipfs://")
+    ? uri.replace("ipfs://", "https://ipfs.io/ipfs/")
+    : uri;
+}
+
+// =======================================================
+//   ⭐ UPDATED processNFT — LISTING TƏMİZLƏMƏ + SAHİBƏ BAXIŞ
+// =======================================================
 async function processNFT(tokenid) {
   try {
-    let owner, success = false;
+    let owner, tokenURI, success = false;
 
-    // A. Blokçeyndən yalnız SAHİBİ (Owner) oxuyuruq
+    // RPC Failover: owner + tokenURI alma
     for (let i = 0; i < RPC_LIST.length; i++) {
       try {
         owner = await nftContract.ownerOf(tokenid);
+        tokenURI = await nftContract.tokenURI(tokenid);
         success = true;
         break;
       } catch (err) {
-        if (err.message && err.message.includes("nonexistent token")) return;
+        if (err.message?.includes("owner query for nonexistent token")) return;
         provider = getProvider();
         nftContract = new ethers.Contract(NFT_CONTRACT_ADDRESS, nftABI, provider);
       }
     }
 
-    if (!success) {
-      console.error(`❌ NFT #${tokenid} sahibi tapılmadı.`);
-      return;
+    if (!success) throw new Error("All RPC endpoints failed");
+
+    // =============================
+    // Metadata Fetch
+    // =============================
+    const httpURI = convertIPFStoHTTP(tokenURI);
+    let name = null;
+    let image = null;
+
+    try {
+      const metadataRes = await fetch(httpURI);
+      const metadata = await metadataRes.json();
+      name = metadata.name || `NFT #${tokenid}`;
+      image = metadata.image || httpURI;
+    } catch {
+      name = `NFT #${tokenid}`;
+      image = httpURI;
     }
 
-    // B. Adı sadəcə ID-yə görə formalaşdırırıq
-    const generatedName = `${COLLECTION_NAME_PREFIX} #${tokenid}`;
-    
     const now = new Date().toISOString();
-    const ownerLower = owner.toLowerCase();
 
-    // C. DB yoxlanışı
+    // =============================
+    //   ADIM 1: Mövcud DB məlumatlarını almaq
+    // =============================
     const { data: existingData } = await supabase
       .from("metadata")
-      .select("seller_address, price, seaport_order, order_hash")
+      .select("buyer_address, seaport_order, price, order_hash")
       .eq("tokenid", tokenid.toString())
       .single();
 
-    let shouldWipeListing = false;
+    // =============================
+    //   ADIM 2: Sahibi dəyişibsə listingi sil
+    // =============================
+    let shouldWipeOrder = false;
 
-    if (existingData && existingData.seller_address) {
-        if (existingData.seller_address.toLowerCase() !== ownerLower) {
-            // console.log(`♻️ NFT #${tokenid} sahibi dəyişib. Listing silinir.`);
-            shouldWipeListing = true;
-        }
+    if (
+      existingData &&
+      existingData.buyer_address &&
+      existingData.buyer_address.toLowerCase() !== owner.toLowerCase()
+    ) {
+      console.log(`♻️ NFT #${tokenid} sahibi dəyişib → Köhnə listing silinir.`);
+      shouldWipeOrder = true;
     }
 
-    // D. Upsert üçün məlumat
+    // =============================
+    //   ADIM 3: Upsert Data Hazırlanır
+    // =============================
     const upsertData = {
       tokenid: tokenid.toString(),
       nft_contract: NFT_CONTRACT_ADDRESS,
-      buyer_address: ownerLower,
-      name: generatedName, 
-      image: null, // Şəkil göstərməyəcəyik
-      updatedat: now
+      marketplace_contract: MARKETPLACE_CONTRACT_ADDRESS,
+      buyer_address: owner.toLowerCase(),
+      on_chain: true,
+      name,
+      image,
+      updatedat: now,
+      createdat: now // upsert-də problem yaratmır
     };
 
-    if (shouldWipeListing) {
-      upsertData.price = null;
-      upsertData.seller_address = null;
-      upsertData.seaport_order = null;
-      upsertData.order_hash = null;
-      upsertData.status = "inactive"; 
-    } else if (existingData) {
-      upsertData.price = existingData.price;
-      upsertData.seller_address = existingData.seller_address;
+    // =============================
+    //   ADIM 4: Listing məlumatlarını saxla və ya sıfırla
+    // =============================
+    if (!shouldWipeOrder && existingData) {
+      // Listing eyni qalır
       upsertData.seaport_order = existingData.seaport_order;
+      upsertData.price = existingData.price;
       upsertData.order_hash = existingData.order_hash;
-    }
-
-    const { error } = await supabase
-      .from("metadata")
-      .upsert(upsertData, { onConflict: "tokenid" });
-
-    if (error) {
-      console.error(`DB Error #${tokenid}:`, error.message);
     } else {
-      // Hər dəfə log çıxmasın deyə, hər 50 dənədən bir yazdırır
-      if (tokenid % 50 === 0) console.log(`✅ Synced up to #${tokenid}`);
+      // Sahibi dəyişəndə sıfırlanır
+      upsertData.seaport_order = null;
+      upsertData.price = null;
+      upsertData.order_hash = null;
     }
 
+    // =============================
+    //   ADIM 5: Upsert
+    // =============================
+    await supabase.from("metadata").upsert(upsertData, {
+      onConflict: "tokenid"
+    });
+
+    console.log(`✅ NFT #${tokenid} sync OK → Owner: ${owner}`);
   } catch (e) {
-    console.warn(`❌ Gözlənilməz xəta #${tokenid}:`, e.message);
+    console.warn(`❌ NFT #${tokenid} ERROR:`, e.message);
   }
 }
 
-// =======================================
-// 5. MAIN LOOP (LIMITLİ)
-// =======================================
+// =======================================================
+// MAIN
+// =======================================================
 async function main() {
-  console.log(`🚀 Sürətli Sync prosesi başladılır... Limit: ${MAX_NFT_ID}`);
-  
   try {
-    // TotalSupply sadəcə məlumat üçün loglanır, dövr üçün istifadə olunmur
-    try {
-        const totalSupply = await nftContract.totalSupply();
-        console.log(`📦 Blokçeyndəki ümumi NFT: ${totalSupply.toString()} (Biz yalnız ${MAX_NFT_ID}-ə qədər oxuyacağıq)`);
-    } catch (e) { console.log("Total supply oxuna bilmədi, davam edirik..."); }
+    const totalSupply = await nftContract.totalSupply();
+    console.log(`🚀 Total minted NFTs: ${totalSupply}`);
 
-    const BATCH_SIZE = 50; 
-    
-    // LOOP: totalSupply YOX, MAX_NFT_ID istifadə edirik
-    for (let i = 1; i <= MAX_NFT_ID; i += BATCH_SIZE) {
-      const batchIds = [];
-      for (let j = 0; j < BATCH_SIZE; j++) {
-        const currentId = i + j;
-        // Limiti keçməməsini təmin edirik
-        if (currentId <= MAX_NFT_ID) {
-            batchIds.push(currentId);
-        }
-      }
+    const BATCH_SIZE = 20;
+    for (let i = 0; i < totalSupply; i += BATCH_SIZE) {
+      const batch = Array.from(
+        { length: BATCH_SIZE },
+        (_, j) => i + j
+      ).filter(id => id < totalSupply);
 
-      if (batchIds.length > 0) {
-          await Promise.all(batchIds.map(id => processNFT(id)));
-          console.log(`Batch ${batchIds[0]}-${batchIds[batchIds.length-1]} bitdi.`);
-      }
+      await Promise.allSettled(batch.map(tokenid => processNFT(tokenid)));
     }
 
-    console.log("🎉 Proses bitdi! 2201-dən yuxarı NFT-lər daxil edilmədi.");
-    process.exit(0);
-    
+    console.log("🎉 NFT metadata + owner sync tamamlandı!");
   } catch (err) {
-    console.error("💀 Error:", err);
+    console.error("💀 Fatal error:", err.message);
     process.exit(1);
   }
 }
